@@ -6,7 +6,7 @@ from datetime import datetime, timedelta
 import logging
 import os
 
-TOKEN = "8661468668:AAFDhmy3auafDTkMZHLiDR6shp7jWxxNx2g"
+TOKEN = "8661468668:AAFwo-Efsrg0ni6gueXyf6u0M1CuzUkHuDc"
 ADMIN_ID = 8401168362
 BOT_USERNAME = "TBADOLEbot"  # ⚠️ غير هذا بدون @
 
@@ -104,6 +104,16 @@ def init_db():
         channel_username TEXT,
         channel_id INTEGER,
         waiting_time TIMESTAMP
+    )''')
+
+    c.execute('''CREATE TABLE IF NOT EXISTS direct_exchange_requests (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        sender_id INTEGER,
+        receiver_id INTEGER,
+        sender_channel TEXT,
+        sender_channel_id INTEGER,
+        request_date TIMESTAMP,
+        status TEXT DEFAULT 'pending'
     )''')
 
     c.execute('''CREATE TABLE IF NOT EXISTS bot_warnings (
@@ -563,7 +573,9 @@ def get_main_menu(user_id):
     markup.add(
         telebot.types.InlineKeyboardButton("💰 دعم البوت", callback_data="support_bot"),
         telebot.types.InlineKeyboardButton("📋 تبادلاتي", callback_data="my_exchanges"))
-    markup.add(telebot.types.InlineKeyboardButton("⏳ قائمة الانتظار", callback_data="show_queue"))
+    markup.add(
+        telebot.types.InlineKeyboardButton("⏳ قائمة الانتظار", callback_data="show_queue"),
+        telebot.types.InlineKeyboardButton("🎯 تبادل مع شخص محدد", callback_data="direct_exchange"))
     if is_admin(user_id):
         markup.add(telebot.types.InlineKeyboardButton("👑 لوحة التحكم", callback_data="admin_panel"))
     return markup
@@ -834,13 +846,14 @@ def callback_handler(call):
             return
         current_uname = get_channel_current_username(check_ref)
 
-        # بحث عن شريك جديد فقط (قناة لم يتبادل معها)
+        # بحث عن شريك -- الشرط الوحيد: لا احد منهم مشترك بقناة الاخر مسبقا
         c.execute("SELECT user_id,channel_username,channel_id FROM waiting_queue WHERE user_id!=? ORDER BY waiting_time ASC", (user_id,))
         partner = None
         for cand_id, cand_ch, cand_ch_id in c.fetchall():
-            if have_exchanged_before(user_id, cand_ch_id, cand_ch):
+            cand_ref = cand_ch_id if cand_ch_id else cand_ch
+            if is_user_subscribed_to_channel(user_id, cand_ref):
                 continue
-            if have_exchanged_before(cand_id, ch_id, current_uname):
+            if is_user_subscribed_to_channel(cand_id, check_ref):
                 continue
             partner = (cand_id, cand_ch, cand_ch_id)
             break
@@ -1058,6 +1071,158 @@ def callback_handler(call):
             bot.edit_message_text(f"✅ <b>شكراً!</b>\n{get_rating_stars(rating)}\n📊 {get_bot_rating()}",
                                   chat_id=call.message.chat.id, message_id=call.message.message_id,
                                   reply_markup=get_main_menu(user_id), parse_mode='HTML')
+        except Exception as e:
+            bot.answer_callback_query(call.id, f"❌ خطأ: {e}")
+        return
+
+    # ===== تبادل مع شخص محدد =====
+    if call.data == "direct_exchange":
+        if not check_force_subscription(user_id):
+            bot.answer_callback_query(call.id, "❌ اشترك في القنوات الاجبارية أولاً!", show_alert=True)
+            return
+        conn = sqlite3.connect('data.db')
+        c = conn.cursor()
+        c.execute("SELECT channel_id,channel_username,channel_name,is_active FROM exchange_channels WHERE owner_id=?", (user_id,))
+        uch = c.fetchone()
+        conn.close()
+        if not uch:
+            bot.answer_callback_query(call.id, "❌ أضف قناة أولاً!", show_alert=True)
+            return
+        ch_id, ch_uname, ch_name, is_active = uch
+        check_ref = ch_id if ch_id else ch_uname
+        if not check_bot_admin_status(check_ref):
+            bot.answer_callback_query(call.id, "❌ البوت ليس مشرفاً في قناتك!", show_alert=True)
+            return
+        msg = bot.send_message(call.message.chat.id,
+            "🎯 <b>تبادل مع شخص محدد</b>\n\n"
+            "أرسل يوزر أو ID الشخص الذي تريد التبادل معه:\n"
+            "مثال: @username أو 123456789\n\n"
+            "⚠️ يجب أن يكون الشخص مسجلاً في البوت ولديه قناة نشطة.",
+            parse_mode='HTML')
+        bot.register_next_step_handler(msg, direct_exchange_step, call.message.message_id)
+        bot.answer_callback_query(call.id)
+        return
+
+    if call.data.startswith("accept_direct_"):
+        try:
+            req_id = int(call.data.split("_")[2])
+            conn = sqlite3.connect('data.db')
+            c = conn.cursor()
+            c.execute("SELECT sender_id,receiver_id,sender_channel,sender_channel_id,status FROM direct_exchange_requests WHERE id=?", (req_id,))
+            req = c.fetchone()
+            if not req:
+                bot.answer_callback_query(call.id, "❌ الطلب غير موجود!", show_alert=True)
+                conn.close()
+                return
+            s_id, r_id, s_ch, s_ch_id, status = req
+            if status != 'pending':
+                bot.answer_callback_query(call.id, "⚠️ تمت معالجة هذا الطلب مسبقاً!", show_alert=True)
+                conn.close()
+                return
+            if user_id != r_id:
+                bot.answer_callback_query(call.id, "❌ هذا الطلب ليس لك!", show_alert=True)
+                conn.close()
+                return
+            # جلب قناة المُستقبِل
+            c.execute("SELECT channel_id,channel_username,channel_name,is_active FROM exchange_channels WHERE owner_id=?", (r_id,))
+            r_ch_row = c.fetchone()
+            if not r_ch_row:
+                bot.answer_callback_query(call.id, "❌ ليس لديك قناة مضافة!", show_alert=True)
+                conn.close()
+                return
+            r_ch_id, r_ch_uname, r_ch_name, r_is_active = r_ch_row
+            r_ref = r_ch_id if r_ch_id else r_ch_uname
+            if not check_bot_admin_status(r_ref):
+                bot.answer_callback_query(call.id, "❌ البوت ليس مشرفاً في قناتك!", show_alert=True)
+                conn.close()
+                return
+            r_current = get_channel_current_username(r_ref)
+            s_ref = s_ch_id if s_ch_id else s_ch
+            s_current = get_channel_current_username(s_ref)
+            # تحقق ان لا احد مشترك بقناة الاخر
+            if is_user_subscribed_to_channel(s_id, r_ref):
+                bot.answer_callback_query(call.id, "❌ لا يمكن التبادل: المرسل مشترك في قناتك مسبقاً", show_alert=True)
+                conn.close()
+                return
+            if is_user_subscribed_to_channel(r_id, s_ref):
+                bot.answer_callback_query(call.id, "❌ لا يمكن التبادل: أنت مشترك في قناة الطرف الآخر مسبقاً", show_alert=True)
+                conn.close()
+                return
+            # إنشاء التبادل
+            c.execute("UPDATE direct_exchange_requests SET status='accepted' WHERE id=?", (req_id,))
+            c.execute("""INSERT INTO completed_exchanges
+                         (user1_id,user1_channel,user1_channel_id,user2_id,user2_channel,user2_channel_id,
+                          exchange_date,user1_confirmed,user2_confirmed)
+                         VALUES (?,?,?,?,?,?,?,0,0)""",
+                      (s_id, s_current, s_ch_id, r_id, r_current, r_ch_id, datetime.now()))
+            ex_id = c.lastrowid
+            s_info = get_user_info(s_id)
+            r_info = get_user_info(r_id)
+            c.execute("""INSERT INTO user_exchanges_history
+                         (user_id,partner_id,partner_channel,partner_channel_id,partner_username,exchange_date,exchange_id,is_active)
+                         VALUES (?,?,?,?,?,?,?,1)""",
+                      (s_id, r_id, r_current, r_ch_id, r_info['username'], datetime.now(), ex_id))
+            c.execute("""INSERT INTO user_exchanges_history
+                         (user_id,partner_id,partner_channel,partner_channel_id,partner_username,exchange_date,exchange_id,is_active)
+                         VALUES (?,?,?,?,?,?,?,1)""",
+                      (r_id, s_id, s_current, s_ch_id, s_info['username'], datetime.now(), ex_id))
+            conn.commit()
+            conn.close()
+            cm = telebot.types.InlineKeyboardMarkup()
+            cm.add(telebot.types.InlineKeyboardButton("✅ أكد اشتراكي في قناة الشريك", callback_data=f"confirm_exchange_{ex_id}"))
+            bot.send_message(s_id,
+                f"🎉 <b>قبِل {r_info['first_name']} طلب التبادل!</b>\n\n"
+                f"📢 قناتك: {s_current}\n"
+                f"👤 {r_info['first_name']} | {r_info['user_link']}\n"
+                f"📢 قناة الشريك: {r_current}\n🔗 https://t.me/{r_current.lstrip('@')}\n\n"
+                f"1️⃣ اشترك في قناة الشريك\n2️⃣ اضغط زر التأكيد",
+                reply_markup=cm, parse_mode='HTML', disable_web_page_preview=True)
+            bot.send_message(r_id,
+                f"🤝 <b>تم قبول التبادل!</b>\n\n"
+                f"📢 قناتك: {r_current}\n"
+                f"👤 {s_info['first_name']} | {s_info['user_link']}\n"
+                f"📢 قناة الشريك: {s_current}\n🔗 https://t.me/{s_current.lstrip('@')}\n\n"
+                f"1️⃣ اشترك في قناة الشريك\n2️⃣ اضغط زر التأكيد",
+                reply_markup=cm, parse_mode='HTML', disable_web_page_preview=True)
+            bot.answer_callback_query(call.id, "✅ تم قبول التبادل!")
+            try:
+                bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=None)
+            except: pass
+        except Exception as e:
+            bot.answer_callback_query(call.id, f"❌ خطأ: {e}")
+        return
+
+    if call.data.startswith("reject_direct_"):
+        try:
+            req_id = int(call.data.split("_")[2])
+            conn = sqlite3.connect('data.db')
+            c = conn.cursor()
+            c.execute("SELECT sender_id,receiver_id,status FROM direct_exchange_requests WHERE id=?", (req_id,))
+            req = c.fetchone()
+            if not req:
+                bot.answer_callback_query(call.id, "❌ الطلب غير موجود!", show_alert=True)
+                conn.close()
+                return
+            s_id, r_id, status = req
+            if status != 'pending':
+                bot.answer_callback_query(call.id, "⚠️ تمت معالجة هذا الطلب مسبقاً!", show_alert=True)
+                conn.close()
+                return
+            if user_id != r_id:
+                bot.answer_callback_query(call.id, "❌ هذا الطلب ليس لك!", show_alert=True)
+                conn.close()
+                return
+            c.execute("UPDATE direct_exchange_requests SET status='rejected' WHERE id=?", (req_id,))
+            conn.commit()
+            conn.close()
+            r_info = get_user_info(r_id)
+            try:
+                bot.send_message(s_id, f"❌ <b>رفض {r_info['first_name']} طلب التبادل.</b>", parse_mode='HTML')
+            except: pass
+            bot.answer_callback_query(call.id, "تم الرفض.")
+            try:
+                bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=None)
+            except: pass
         except Exception as e:
             bot.answer_callback_query(call.id, f"❌ خطأ: {e}")
         return
@@ -1681,6 +1846,84 @@ def get_user_to_rate_step(message, original_msg_id):
     bot.reply_to(message, f"⭐ <b>تقييم {target_name}:</b>\n\nاختر:", reply_markup=markup, parse_mode='HTML')
     try: bot.delete_message(message.chat.id, original_msg_id)
     except: pass
+
+def direct_exchange_step(message, original_msg_id):
+    user_id = message.from_user.id
+    result = resolve_user(message.text.strip())
+    if not result:
+        bot.reply_to(message, "❌ لم يُعثر على المستخدم — تأكد من اليوزر أو ID")
+        return
+    target_id, target_name = result
+    if target_id == user_id:
+        bot.reply_to(message, "❌ لا يمكنك إرسال طلب تبادل لنفسك!")
+        return
+    # تحقق من أن المُرسِل لديه قناة
+    conn = sqlite3.connect('data.db')
+    c = conn.cursor()
+    c.execute("SELECT channel_id,channel_username,channel_name,is_active FROM exchange_channels WHERE owner_id=?", (user_id,))
+    my_ch = c.fetchone()
+    if not my_ch:
+        bot.reply_to(message, "❌ ليس لديك قناة مضافة!")
+        conn.close()
+        return
+    my_ch_id, my_ch_uname, my_ch_name, my_is_active = my_ch
+    # تحقق من أن الشريك لديه قناة
+    c.execute("SELECT channel_id,channel_username,channel_name,is_active FROM exchange_channels WHERE owner_id=?", (target_id,))
+    t_ch = c.fetchone()
+    if not t_ch:
+        bot.reply_to(message, f"❌ {target_name} ليس لديه قناة مضافة في البوت!")
+        conn.close()
+        return
+    t_ch_id = t_ch[0]; t_ch_uname = t_ch[1]
+    # تحقق ان لا احد منهم مشترك بقناة الاخر
+    my_ref_chk = my_ch_id if my_ch_id else my_ch_uname
+    t_ref_chk = t_ch_id if t_ch_id else t_ch_uname
+    if is_user_subscribed_to_channel(user_id, t_ref_chk):
+        bot.reply_to(message, f"❌ لا يمكن التبادل مع {target_name} (أنت مشترك في قناته مسبقاً)")
+        conn.close()
+        return
+    if is_user_subscribed_to_channel(target_id, my_ref_chk):
+        bot.reply_to(message, f"❌ لا يمكن التبادل مع {target_name} (هو مشترك في قناتك مسبقاً)")
+        conn.close()
+        return
+    # تحقق من عدم وجود طلب معلق مسبق
+    c.execute("SELECT COUNT(*) FROM direct_exchange_requests WHERE sender_id=? AND receiver_id=? AND status='pending'", (user_id, target_id))
+    if c.fetchone()[0] > 0:
+        bot.reply_to(message, f"⚠️ لديك طلب تبادل معلق مع {target_name} بالفعل!")
+        conn.close()
+        return
+    # إنشاء الطلب
+    my_ref = my_ch_id if my_ch_id else my_ch_uname
+    my_current = get_channel_current_username(my_ref)
+    c.execute("INSERT INTO direct_exchange_requests (sender_id,receiver_id,sender_channel,sender_channel_id,request_date,status) VALUES (?,?,?,?,?,'pending')",
+              (user_id, target_id, my_current, my_ch_id, datetime.now()))
+    req_id = c.lastrowid
+    conn.commit()
+    conn.close()
+    # إرسال الطلب للمستقبِل
+    u_info = get_user_info(user_id)
+    t_ref = t_ch_id if t_ch_id else t_ch_uname
+    t_current = get_channel_current_username(t_ref)
+    markup = telebot.types.InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        telebot.types.InlineKeyboardButton("✅ قبول", callback_data=f"accept_direct_{req_id}"),
+        telebot.types.InlineKeyboardButton("❌ رفض", callback_data=f"reject_direct_{req_id}"))
+    try:
+        bot.send_message(target_id,
+            f"🎯 <b>طلب تبادل مباشر!</b>\n\n"
+            f"👤 {u_info['first_name']} | {u_info['user_link']}\n"
+            f"📢 قناته: {my_current}\n🔗 https://t.me/{my_current.lstrip('@')}\n\n"
+            f"⭐ تقييمه: {get_user_rating_display(user_id)}\n\n"
+            f"هل تقبل التبادل معه؟",
+            reply_markup=markup, parse_mode='HTML', disable_web_page_preview=True)
+        bot.reply_to(message,
+            f"✅ <b>تم إرسال طلب التبادل إلى {target_name}!</b>\n\n"
+            f"📢 قناته: {t_current}\n\nسيُعلَمك عند الرد.", parse_mode='HTML')
+    except Exception as e:
+        bot.reply_to(message, f"❌ تعذّر إرسال الطلب إلى {target_name}\n(قد يكون أوقف البوت)")
+    try: bot.delete_message(message.chat.id, original_msg_id)
+    except: pass
+
 
 # ================= الدفع =================
 
